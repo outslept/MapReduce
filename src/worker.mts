@@ -1,178 +1,295 @@
-import path from "node:path";
-import { pathToFileURL } from "node:url";
-import { randomUUID } from "node:crypto";
 import { createReadStream, promises as fsp } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { isPollResponse, type KV, type MapFn, type PluginModule, type PollResponse, type ReduceFn } from "./protocol.mjs";
+import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
-import { isPollResponse, type KV, type MapFn, type PollResponse, type ReduceFn, type PluginModule } from "./protocol.mjs";
+import { setTimeout as delay } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 
 /**
- * CLI arguments for the worker entrypoint
+ * Worker CLI arguments
  *
- * @property coordUrl — Coordinator base URL (e.g., http://127.0.0.1:8787)
- * @property pluginPath — Filesystem path to the plugin module exporting map/reduce
+ * @property coordUrl - Coordinator base URL (e.g., http://127.0.0.1:8787)
+ * @property pluginPath - Filesystem path to a module exporting map/reduce
  */
 interface Args {
   readonly coordUrl: string;
   readonly pluginPath: string;
 }
 
+const DEFAULT_COORD_URL = "http://127.0.0.1:8787";
+const DEFAULT_PLUGIN_PATH = "./plugins/wc.mts";
+
+const FLAG_VALUE_INDEX = 1;
+const ARG_SLICE_INDEX = 2;
+
+const SLEEP_IDLE_MS = 200;
+const SLEEP_FAILURE_MS = 300;
+
+const EXIT_OK = 0;
+const EXIT_ERR = 1;
+
+const EMPTY = 0;
+const HEX_RADIX = 16;
+
+const FNV_OFFSET_BASIS = 0x811C9DC5;
+const FNV_PRIME = 0x01000193;
+
 /**
- * Parse CLI arguments in the form:
- *  --coord=<url> --plugin=<path>
+ * Parse CLI arguments in the form `--coord=<url> --plugin=<path>`
  *
- * @param argv — Raw process arguments (excluding node and script path)
+ * @param argv - Raw process arguments (e.g., process.argv.slice(2))
  * @returns Parsed {@link Args}
- */
-function parseArgs(argv: readonly string[]): Args {
-  const coordUrl = (argv.find(a => a.startsWith("--coord=")) ?? "--coord=http://127.0.0.1:8787").split("=")[1]!;
-  const pluginPath = (argv.find(a => a.startsWith("--plugin=")) ?? "--plugin=./plugins/wc.js").split("=")[1]!;
-  return { coordUrl, pluginPath };
-}
-
-/**
- * Compute FNV-1a 32-bit hash of a string
  *
- * @param s — Input string
- * @returns Unsigned 32-bit hash
+ * @example
+ * const args = parseArgs(["--coord=http://127.0.0.1:8787","--plugin=./plugins/wc.mts"])
+ * // args.coordUrl === "http://127.0.0.1:8787"
  */
-function fnv1a32(s: string): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
+const parseArgs = (argv: readonly string[]): Args => {
+  let coordUrl = DEFAULT_COORD_URL;
+  let pluginPath = DEFAULT_PLUGIN_PATH;
+
+  for (const arg of argv) {
+    if (arg.startsWith("--coord=")) {
+      const parts = arg.split("=");
+      if (parts.length > FLAG_VALUE_INDEX) {
+        coordUrl = parts[FLAG_VALUE_INDEX]!;
+      }
+    } else if (arg.startsWith("--plugin=")) {
+      const parts = arg.split("=");
+      if (parts.length > FLAG_VALUE_INDEX) {
+        pluginPath = parts[FLAG_VALUE_INDEX]!;
+      }
+    }
   }
-  return h >>> 0;
-}
+
+  return { coordUrl, pluginPath };
+};
 
 /**
- * Partition key into one of nReduce buckets using {@link fnv1a32}
+ * Compute FNV‑1a 32-bit hash for a UTF‑16 string
  *
- * @param key — Map output key
- * @param nReduce — Total number of reduce partitions
- * @returns Bucket index in [0, nReduce)
+ * @param input - String to hash
+ * @returns Unsigned 32-bit hash
+ *
+ * @example
+ * const h = fnv1a32("key")
  */
-function ihash(key: string, nReduce: number): number {
-  return fnv1a32(key) % nReduce;
-}
+const fnv1a32 = (input: string): number => {
+  let hash = FNV_OFFSET_BASIS;
+  for (let index = 0; index < input.length; index++) {
+    hash ^= input.charCodeAt(index);
+    hash = Math.imul(hash, FNV_PRIME) >>> 0;
+  }
+  return hash >>> 0;
+};
 
 /**
- * POST JSON helper with strict 2xx requirement
+ * Map a key to a reduce bucket index
  *
- * @param url — Target URL
- * @param body — Serializable payload
- * @returns Parsed JSON as T
- * @throws Error — If HTTP status is not ok (2xx) or parsing fails
+ * @param key - Partition key
+ * @param nReduce - Total number of reducers (must be > 0)
+ * @returns Index in [0, nReduce)
+ *
+ * @example
+ * const bucket = ihash("word", 4) // 0..3
  */
-async function postJSON<T>(url: string, body: unknown): Promise<T> {
-  const resp = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  return (await resp.json()) as T;
-}
+const ihash = (key: string, nReduce: number): number => fnv1a32(key) % nReduce;
+
+/**
+ * POST JSON helper with strict 2xx check
+ *
+ * @param url - Coordinator endpoint
+ * @param body - Serializable JSON body
+ * @returns Parsed JSON (unknown); call-site should narrow with type guards
+ * @throws Error - If HTTP status is not ok (2xx) or JSON parsing fails
+ *
+ * @example
+ * const reply = await postJSON("http://127.0.0.1:8787/pollTask", { workerId: "w1" })
+ */
+const postJSON = async (url: string, body: unknown): Promise<unknown> => {
+  const response = await fetch(url, {
+    body: JSON.stringify(body),
+    headers: { "Content-Type": "application/json" },
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const data: unknown = await response.json();
+  return data;
+};
 
 /**
  * Write a file atomically via a temporary file + rename
  *
- * @param filePath — Final file path
- * @param data — File contents
+ * @param filePath - Final file path
+ * @param data - File contents
+ * @returns Resolves when the file is fully written
+ *
+ * @example
+ * await writeAtomic("mr-out-0", "payload\n")
  */
-async function writeAtomic(filePath: string, data: string | Buffer): Promise<void> {
-  const tmp = `${filePath}.${Math.random().toString(16).slice(2)}.tmp`;
+const writeAtomic = async (filePath: string, data: string | Buffer): Promise<void> => {
+  const tmp = `${filePath}.${Math.random().toString(HEX_RADIX).slice(FLAG_VALUE_INDEX)}.tmp`;
   await fsp.writeFile(tmp, data);
   await fsp.rename(tmp, filePath);
-}
+};
 
 /**
- * Write rows as newline-delimited JSON (NDJSON)
+ * Write KV rows as newline-delimited JSON (NDJSON)
  *
- * @param filePath — Destination path
- * @param rows — KV records
+ * @param filePath - Destination path
+ * @param rows - KV records to write
+ * @returns Resolves when writing completes
+ *
+ * @example
+ * await writeJsonl("mr-0-1-worker.jsonl", [{ key: "word", value: "1" }])
  */
-async function writeJsonl(filePath: string, rows: ReadonlyArray<KV>): Promise<void> {
-  const payload = rows.map(r => JSON.stringify(r)).join("\n") + (rows.length ? "\n" : "");
+const writeJsonl = async (filePath: string, rows: readonly KV[]): Promise<void> => {
+  let payload = rows.map((row) => JSON.stringify(row)).join("\n");
+  if (rows.length > EMPTY) {
+    payload += "\n";
+  }
   await writeAtomic(filePath, payload);
-}
+};
 
 /**
- * Read multiple NDJSON files containing KV objects
+ * Read KV pairs from multiple NDJSON files
  *
- * @param paths — File paths
- * @returns Parsed KV list
+ * @param paths - File paths to read (missing or malformed files are skipped)
+ * @returns All parsed KV objects
+ *
+ * @example
+ * const kvs = await readJsonlFiles(["mr-0-0-a.jsonl","mr-1-0-b.jsonl"])
  */
-async function readJsonlFiles(paths: readonly string[]): Promise<KV[]> {
+const readJsonlFiles = async (paths: readonly string[]): Promise<KV[]> => {
   const out: KV[] = [];
-  for (const p of paths) {
+  for (const filePath of paths) {
     try {
-      const rl = createInterface({ input: createReadStream(p), crlfDelay: Infinity });
+      const rl = createInterface({ crlfDelay: Infinity, input: createReadStream(filePath) });
       for await (const line of rl) {
-        if (!line) continue;
-        const j = JSON.parse(line) as unknown;
-        if (typeof j === "object" && j !== null && "key" in j && "value" in j) {
-          const k = (j as { key: unknown }).key;
-          const v = (j as { value: unknown }).value;
-          if (typeof k === "string" && typeof v === "string") out.push({ key: k, value: v });
+        if (line.length === EMPTY) {
+          // skip empty
+        } else {
+          const obj = JSON.parse(line) as unknown;
+          if (typeof obj === "object" && obj !== null && "key" in obj && "value" in obj) {
+            const keyAny = (obj as { key: unknown }).key;
+            const valueAny = (obj as { value: unknown }).value;
+            if (typeof keyAny === "string" && typeof valueAny === "string") {
+              out.push({ key: keyAny, value: valueAny });
+            }
+          }
         }
       }
-    } catch { /* ignore */ }
+    } catch {
+      // ignore
+    }
   }
   return out;
-}
+};
 
 /**
  * Sort KVs by key and group adjacent values
  *
- * @param kvs — Input KV list (mutated by sort)
+ * @param pairs - KV records (mutated in place by sort)
  * @returns Array of [key, values[]] groups in ascending key order
+ *
+ * @example
+ * const groups = groupByKeySorted([{key:"a",value:"1"},{key:"a",value:"1"},{key:"b",value:"1"}])
  */
-function groupByKeySorted(kvs: KV[]): ReadonlyArray<readonly [string, string[]]> {
-  kvs.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
-  const res: Array<readonly [string, string[]]> = [];
-  let curKey: string | null = null;
-  let cur: string[] = [];
-  for (const { key, value } of kvs) {
-    if (key !== curKey) {
-      if (curKey !== null) res.push([curKey, cur]);
-      curKey = key; cur = [value];
+const groupByKeySorted = (pairs: KV[]): readonly (readonly [string, string[]])[] => {
+  pairs.sort((left, right) => left.key.localeCompare(right.key));
+  const grouped: (readonly [string, string[]])[] = [];
+  let currentKey: string | undefined = undefined;
+  let currentValues: string[] = [];
+  for (const { key, value } of pairs) {
+    if (key !== currentKey) {
+      if (currentKey !== undefined) {
+        grouped.push([currentKey, currentValues]);
+      }
+      currentKey = key;
+      currentValues = [value];
     } else {
-      cur.push(value);
+      currentValues.push(value);
     }
   }
-  if (curKey !== null) res.push([curKey, cur]);
-  return res;
+  if (currentKey !== undefined) {
+    grouped.push([currentKey, currentValues]);
+  }
+  return grouped;
+};
+
+/**
+ * Options for executing a single map task
+ *
+ * @property mapId - Map task id
+ * @property filename - Input file path for this map
+ * @property nReduce - Number of reduce partitions
+ * @property workerId - Worker id used in intermediate filenames
+ * @property mapFn - Plugin map function
+ */
+interface MapTaskOptions {
+  readonly mapId: number;
+  readonly filename: string;
+  readonly nReduce: number;
+  readonly workerId: string;
+  readonly mapFn: MapFn;
 }
 
 /**
- * Execute a map task:
- * - Read input file
- * - Run plugin map
- * - Partition results and write NDJSON buckets mr-<mapId>-<reduceId>-<workerId>.jsonl
+ * Execute a map task
  *
- * @param mapId — Map task id
- * @param filename — Input file path
- * @param nReduce — Number of reduce buckets
- * @param workerId — Stable worker UUID for file names
- * @param mapFn — Plugin map function
+ * Reads the input file, runs the plugin map, partitions results by reduceId,
+ * and writes mr-<mapId>-<reduceId>-<workerId>.jsonl files.
+ *
+ * @param options - {@link MapTaskOptions}
+ * @returns Resolves when all bucket files are written
+ *
+ * @example
+ * await doMapTask({ mapId: 0, filename: "data/pg-1.txt", nReduce: 4, workerId: "w1", mapFn })
  */
-async function doMapTask(mapId: number, filename: string, nReduce: number, workerId: string, mapFn: MapFn): Promise<void> {
+const doMapTask = async (options: MapTaskOptions): Promise<void> => {
+  const { filename, mapFn, mapId, nReduce, workerId } = options;
   const content = await fsp.readFile(filename, "utf8");
   const kvs = mapFn(filename, content);
   const buckets: KV[][] = Array.from({ length: nReduce }, () => []);
-  for (const kv of kvs) buckets[ihash(kv.key, nReduce)]!.push(kv);
-  await Promise.all(buckets.map((rows, reduceId) => writeJsonl(`mr-${mapId}-${reduceId}-${workerId}.jsonl`, rows)));
-}
+
+  for (const pair of kvs) {
+    const index = ihash(pair.key, nReduce);
+    const bucket = buckets[index];
+    if (bucket === undefined) {
+      buckets[index] = [pair];
+    } else {
+      bucket.push(pair);
+    }
+  }
+
+  await Promise.all(
+    buckets.map(async (rows, reduceId) => {
+      const outPath = `mr-${mapId}-${reduceId}-${workerId}.jsonl`;
+      await writeJsonl(outPath, rows);
+    })
+  );
+};
 
 /**
- * Execute a reduce task:
- * - Collect all mr-*-<reduceId>-*.jsonl files
- * - Group values by key
- * - Apply plugin reduce and write mr-out-<reduceId>
+ * Execute a reduce task
  *
- * @param reduceId — Reduce partition id
- * @param reduceFn — Plugin reduce function
+ * Collects all intermediate files for the given reduceId, groups by key, runs
+ * the plugin reduce for each group, and writes mr-out-<reduceId>.
+ *
+ * @param reduceId - Reduce partition id
+ * @param reduceFn - Plugin reduce function
+ * @returns Resolves when the final output is written
+ *
+ * @example
+ * await doReduceTask(0, reduceFn)
  */
-async function doReduceTask(reduceId: number, reduceFn: ReduceFn): Promise<void> {
+const doReduceTask = async (reduceId: number, reduceFn: ReduceFn): Promise<void> => {
   const names = await fsp.readdir(process.cwd());
   const rx = new RegExp(`^mr-(\\d+)-${reduceId}-[a-f0-9-]+\\.jsonl$`);
-  const files = names.filter(n => rx.test(n));
+  const files = names.filter((name) => rx.test(name));
   const kvs = await readJsonlFiles(files);
   const groups = groupByKeySorted(kvs);
   let out = "";
@@ -180,74 +297,167 @@ async function doReduceTask(reduceId: number, reduceFn: ReduceFn): Promise<void>
     out += `${key} ${reduceFn(key, values)}\n`;
   }
   await writeAtomic(`mr-out-${reduceId}`, out);
-}
+};
 
 /**
- * Convert a filesystem path to a file:// URL for ESM dynamic import
+ * Convert a filesystem path to a file:// URL for dynamic ESM import
  *
- * @param p — Path (absolute or relative)
- * @returns File URL
+ * @param filePath - Absolute or relative path
+ * @returns File URL suitable for import()
+ *
+ * @example
+ * const url = toFileUrl("./plugins/wc.mts")
  */
-function toFileUrl(p: string): string {
-  const abs = path.isAbsolute(p) ? p : path.join(process.cwd(), p);
+const toFileUrl = (filePath: string): string => {
+  const abs = isAbsolute(filePath) ? filePath : join(process.cwd(), filePath);
   return pathToFileURL(abs).href;
-}
+};
 
 /**
- * Load a plugin module and validate required exports
+ * Narrow an unknown to a plain record
  *
- * @param pluginPath — Filesystem path to the plugin module
- * @returns Loaded {@link PluginModule}
- * @throws Error — If module does not export map and reduce functions
+ * @param v - Value to check
+ * @returns True if v is a non-null object
+ * @internal
  */
-async function loadPlugin(pluginPath: string): Promise<PluginModule> {
-  const mod = await import(toFileUrl(pluginPath));
-  const map = (mod as Partial<PluginModule>).map;
-  const reduce = (mod as Partial<PluginModule>).reduce;
-  if (typeof map !== "function" || typeof reduce !== "function") {
-    throw new Error("plugin must export map(filename, content) and reduce(key, values)");
-  }
-  return { map, reduce };
-}
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
 
-async function main(): Promise<void> {
-  const { coordUrl, pluginPath } = parseArgs(process.argv.slice(2));
+/**
+ * Validate a plugin-like object (has map and reduce functions)
+ *
+ * @param v - Candidate object
+ * @returns True if v has callable map and reduce
+ * @internal
+ */
+const isPluginModule = (v: unknown): v is PluginModule => {
+  return isRecord(v) && typeof v.map === "function" && typeof v.reduce === "function";
+};
+
+/**
+ * Dynamically load a plugin module and validate its shape
+ *
+ * Accepts either named exports (`export const map/reduce`) or a default
+ * export object `{ map, reduce }`.
+ *
+ * @param pluginPath - Filesystem path to the plugin module
+ * @returns Loaded {@link PluginModule}
+ * @throws Error - If the module does not export both map and reduce functions
+ *
+ * @example
+ * const plugin = await loadPlugin("./plugins/wc.mts")
+ */
+const loadPlugin = async (pluginPath: string): Promise<PluginModule> => {
+  const modNs: unknown = await import(toFileUrl(pluginPath));
+  let candidate: unknown = modNs;
+
+  if (isRecord(modNs)) {
+    const maybeDefault = Reflect.get(modNs, "default");
+    if (maybeDefault !== undefined) {
+      candidate = maybeDefault;
+    }
+  }
+
+  if (isPluginModule(candidate)) {
+    return candidate;
+  }
+
+  throw new Error("plugin must export map(filename, content) and reduce(key, values)");
+};
+
+const main = async (): Promise<void> => {
+  const { coordUrl, pluginPath } = parseArgs(process.argv.slice(ARG_SLICE_INDEX));
   const workerId = randomUUID();
   const plugin = await loadPlugin(pluginPath);
 
   console.log(`worker ${workerId} -> ${coordUrl}`);
 
-  for (;;) {
-    let raw: unknown;
+  /**
+   * Execute one scheduling iteration:
+   * - Poll for a task
+   * - Sleep on "sleep" or invalid payload
+   * - Exit on "done"
+   * - Run map/reduce with success/failure reporting
+   *
+   * @returns Resolves after one iteration delay or task execution
+   */
+  const tick = async (): Promise<void> => {
+    let payload: unknown;
     try {
-      raw = await postJSON<unknown>(`${coordUrl}/pollTask`, { workerId });
+      payload = await postJSON(`${coordUrl}/pollTask`, { workerId });
     } catch {
-      process.exit(0);
+      process.exit(EXIT_OK);
     }
-    if (!isPollResponse(raw)) {
-      await new Promise(r => setTimeout(r, 200));
-      continue;
+
+    if (!isPollResponse(payload)) {
+      await delay(SLEEP_IDLE_MS);
+      return;
     }
-    const task: PollResponse = raw;
-    if (task.type === "sleep") { await new Promise(r => setTimeout(r, 200)); continue; }
-    if (task.type === "done") { process.exit(0); }
+
+    const task: PollResponse = payload;
+
+    if (task.type === "sleep") {
+      await delay(SLEEP_IDLE_MS);
+      return;
+    }
+
+    if (task.type === "done") {
+      process.exit(EXIT_OK);
+    }
+
     try {
       if (task.type === "map") {
-        await doMapTask(task.mapId, task.file, task.nReduce, workerId, plugin.map);
-        await postJSON(`${coordUrl}/reportTask`, { workerId, type: "map", mapId: task.mapId, success: true });
+        await doMapTask({
+          filename: task.file,
+          mapFn: plugin.map,
+          mapId: task.mapId,
+          nReduce: task.nReduce,
+          workerId,
+        });
+        await postJSON(`${coordUrl}/reportTask`, {
+          mapId: task.mapId,
+          success: true,
+          type: "map",
+          workerId,
+        });
       } else {
         await doReduceTask(task.reduceId, plugin.reduce);
-        await postJSON(`${coordUrl}/reportTask`, { workerId, type: "reduce", reduceId: task.reduceId, success: true });
+        await postJSON(`${coordUrl}/reportTask`, {
+          reduceId: task.reduceId,
+          success: true,
+          type: "reduce",
+          workerId,
+        });
       }
     } catch {
       if (task.type === "map") {
-        await postJSON(`${coordUrl}/reportTask`, { workerId, type: "map", mapId: task.mapId, success: false });
+        await postJSON(`${coordUrl}/reportTask`, {
+          mapId: task.mapId,
+          success: false,
+          type: "map",
+          workerId,
+        });
       } else {
-        await postJSON(`${coordUrl}/reportTask`, { workerId, type: "reduce", reduceId: task.reduceId, success: false });
+        await postJSON(`${coordUrl}/reportTask`, {
+          reduceId: task.reduceId,
+          success: false,
+          type: "reduce",
+          workerId,
+        });
       }
-      await new Promise(r => setTimeout(r, 300));
+      await delay(SLEEP_FAILURE_MS);
     }
-  }
-}
+  };
 
-main().catch(() => process.exit(1));
+  for (;;) {
+    await tick();
+  }
+};
+
+void (async () => {
+  try {
+    await main();
+  } catch (error) {
+    console.error(error);
+    process.exit(EXIT_ERR);
+  }
+})();

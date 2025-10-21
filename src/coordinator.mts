@@ -1,7 +1,8 @@
-import http from "node:http";
 import { promises as fsp } from "node:fs";
 import { glob } from "tinyglobby";
-import { isPollRequest, isReportRequest, type PollRequest, type PollResponse, type ReportRequest } from "./protocol.mjs";
+import * as http from "node:http";
+import type { PollRequest, PollResponse, ReportRequest } from "./protocol.mjs";
+import { isPollRequest, isReportRequest } from "./protocol.mjs";
 
 type Phase = "map" | "reduce" | "done";
 
@@ -27,160 +28,283 @@ interface Args {
 }
 
 const TIMEOUT_MS = 10_000;
+const MIN_PORT = 1;
+const MIN_REDUCERS = 1;
+const FLAG_VALUE_INDEX = 1;
+const ARGV_USER_INDEX = 2;
+const EMPTY_LENGTH = 0;
+const EXIT_ERROR = 1;
+
+const HTTP_STATUS = {
+  BAD_REQUEST: 400,
+  INTERNAL_ERROR: 500,
+  NOT_FOUND: 404,
+  OK: 200,
+} as const;
+
+/** Return a coarse timestamp in milliseconds */
+const now = (): number => Date.now();
 
 /**
- * Expand CLI args:
- *  --port=<number> --nReduce=<number> <patterns...>
- * patterns can be files or glob patterns (e.g., "data/pg-*.txt")
+ * Check whether all tasks in a phase are complete
+ *
+ * @typeParam TaskType - task-like objects with a state field
+ * @param items - Task collection to check
+ * @returns True if every task is "done"
  */
-async function parseArgs(argv: readonly string[]): Promise<Args> {
-  const port = Number((argv.find(a => a.startsWith("--port=")) ?? "--port=8787").split("=")[1]);
-  const nReduce = Number((argv.find(a => a.startsWith("--nReduce=")) ?? "--nReduce=4").split("=")[1]);
-  const raw = argv.filter(a => !a.startsWith("--"));
+const allDone = <TaskType extends { state: "idle" | "in-progress" | "done" }>(items: readonly TaskType[]): boolean =>
+  items.every(task => task.state === "done");
 
-  const patterns = raw.map(p => p.replace(/\\/g, "/"));
+/**
+ * Clear transient assignee metadata for a task (worker id and start time)
+ *
+ * @param task - Task object to clear
+ */
+const clearAssignee = (task: { workerId?: string; startedAtMs?: number }): void => {
+  delete task.workerId;
+  delete task.startedAtMs;
+};
 
-  let matched = patterns.length > 0 ? await glob(patterns) : [];
-  {
-    const seen = new Set<string>();
-    const files: string[] = [];
-    for (const m of matched) {
-      if (seen.has(m)) continue;
-      seen.add(m);
-      try {
-        const st = await fsp.stat(m);
-        if (st.isFile()) files.push(m);
-      } catch {
-        // ignore
-      }
-    }
-    files.sort((a, b) => a.localeCompare(b));
-    matched = files;
+/**
+ * Parse CLI arguments and expand input file globs
+ *
+ * Accepts `--port=<number>`, `--nReduce=<number>`, and a list of file/glob patterns
+ * (e.g., "data/pg-*.txt"). Patterns are resolved, validated as files, de-duplicated,
+ * and sorted deterministically.
+ *
+ * @param argv - Raw process arguments starting at the first user arg (e.g., process.argv.slice(2))
+ * @returns Parsed {@link Args} with resolved input files
+ * @throws Error - If port or nReduce are invalid or no input files are found
+ *
+ * @example
+ * // argv: ["--port=8787","--nReduce=4","data/pg-*.txt"]
+ * const cfg = await parseArgs(argv)
+ * // cfg.inputFiles => ["data/pg-0001.txt", ...]
+ */
+const parseArgs = async (argv: readonly string[]): Promise<Args> => {
+  const portFlag = argv.find(arg => arg.startsWith("--port=")) ?? "--port=8787";
+  const nReduceFlag = argv.find(arg => arg.startsWith("--nReduce=")) ?? "--nReduce=4";
+  const port = Number(portFlag.split("=")[FLAG_VALUE_INDEX]);
+  const nReduce = Number(nReduceFlag.split("=")[FLAG_VALUE_INDEX]);
+
+  const rawInputs = argv.filter(arg => !arg.startsWith("--"));
+  const patterns = rawInputs.map(pattern => pattern.replace(/\\/g, "/"));
+
+  let matched: string[] = [];
+  if (patterns.length > EMPTY_LENGTH) {
+    const candidates = await glob(patterns);
+
+    const validated = (await Promise.all(
+      candidates.map(async (candidatePath) => {
+        try {
+          const stat = await fsp.stat(candidatePath);
+          if (stat.isFile()) {
+            return candidatePath;
+          }
+        } catch {
+          // noop
+        }
+        return undefined;
+      })
+    )).filter((candidatePath): candidatePath is string => candidatePath !== undefined);
+
+    const unique = new Set<string>(validated);
+    matched = [...unique];
+    matched.sort((first, second) => first.localeCompare(second));
   }
 
-  if (!Number.isInteger(port) || port <= 0) throw new Error("bad --port");
-  if (!Number.isInteger(nReduce) || nReduce <= 0) throw new Error("bad --nReduce");
-  if (matched.length === 0) throw new Error("no input files");
+  if (!Number.isInteger(port) || port < MIN_PORT) {
+    throw new Error("bad --port");
+  }
+  if (!Number.isInteger(nReduce) || nReduce < MIN_REDUCERS) {
+    throw new Error("bad --nReduce");
+  }
+  if (matched.length === EMPTY_LENGTH) {
+    throw new Error("no input files");
+  }
 
-  return { port, nReduce, inputFiles: matched };
-}
+  return { inputFiles: matched, nReduce, port };
+};
 
-function now(): number { return Date.now(); }
-function allDone<T extends { state: "idle" | "in-progress" | "done" }>(xs: readonly T[]): boolean {
-  return xs.every(t => t.state === "done");
-}
+/**
+ * Read and parse the request body as JSON
+ *
+ * @param req - Incoming HTTP message
+ * @returns Parsed JSON value (unknown)
+ * @throws SyntaxError - If the request body is not valid JSON
+ *
+ * @example
+ * // inside a request handler
+ * const body = await readJson(req)
+ */
+const readJson = async (req: http.IncomingMessage): Promise<unknown> => {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) {
+    const buf = Buffer.from(chunk);
+    chunks.push(buf);
+  }
+  const body = Buffer.concat(chunks).toString("utf8");
+  if (body.length === EMPTY_LENGTH) {
+    return {};
+  }
+  return JSON.parse(body);
+};
 
-function readJson(req: http.IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    let buf = "";
-    req.on("data", (c: Buffer) => { buf += c.toString("utf8"); });
-    req.on("end", () => { try { resolve(buf ? JSON.parse(buf) : {}); } catch (e) { reject(e); } });
-    req.on("error", reject);
-  });
-}
-
-function createServer(args: Args): http.Server {
-  const mapTasks: MapTask[] = args.inputFiles.map((file, id) => ({ id, file, state: "idle" }));
-  const reduceTasks: ReduceTask[] = Array.from({ length: args.nReduce }, (_, id) => ({ id, state: "idle" }));
+/**
+ * Create and configure the coordinator HTTP server
+ *
+ * Initializes task metadata from resolved input files, tracks phase transitions,
+ * and exposes JSON RPC endpoints consumed by workers.
+ *
+ * @param args - {@link Args} including input files, reducer count, and port
+ * @returns An HTTP server instance (not yet listening)
+ */
+const createServer = (args: Args): http.Server => {
+  const mapTasks: MapTask[] = args.inputFiles.map((filePath, taskId) => ({ file: filePath, id: taskId, state: "idle" }));
+  const reduceTasks: ReduceTask[] = Array.from({ length: args.nReduce }, (_unused, taskId) => ({ id: taskId, state: "idle" }));
   let phase: Phase = "map";
 
-  const clearAssignee = (t: { workerId?: string; startedAtMs?: number }): void => {
-    delete t.workerId;
-    delete t.startedAtMs;
-  };
-
+  /** Return in-progress tasks back to idle after TIMEOUT_MS */
   const reapTimeouts = (): void => {
-    const cutoff = now() - TIMEOUT_MS;
-    for (const t of mapTasks) {
-      if (t.state === "in-progress" && t.startedAtMs !== undefined && t.startedAtMs <= cutoff) {
-        t.state = "idle"; clearAssignee(t);
+    const deadline = now() - TIMEOUT_MS;
+
+    for (const task of mapTasks) {
+      if (task.state === "in-progress" && task.startedAtMs !== undefined && task.startedAtMs <= deadline) {
+        task.state = "idle";
+        clearAssignee(task);
       }
     }
-    for (const t of reduceTasks) {
-      if (t.state === "in-progress" && t.startedAtMs !== undefined && t.startedAtMs <= cutoff) {
-        t.state = "idle"; clearAssignee(t);
+    for (const task of reduceTasks) {
+      if (task.state === "in-progress" && task.startedAtMs !== undefined && task.startedAtMs <= deadline) {
+        task.state = "idle";
+        clearAssignee(task);
       }
     }
   };
 
+  /**
+   * Handle a worker polling for a task
+   *
+   * @param req - {@link PollRequest} with the worker id
+   * @returns {@link PollResponse} describing the next action
+   */
   const onPoll = (req: PollRequest): PollResponse => {
     reapTimeouts();
 
     if (phase === "map") {
-      const t = mapTasks.find(x => x.state === "idle");
-      if (t) {
-        t.state = "in-progress"; t.workerId = req.workerId; t.startedAtMs = now();
-        return { type: "map", mapId: t.id, file: t.file, nReduce: args.nReduce };
+      const task = mapTasks.find(item => item.state === "idle");
+      if (task) {
+        task.state = "in-progress";
+        task.workerId = req.workerId;
+        task.startedAtMs = now();
+        return { file: task.file, mapId: task.id, nReduce: args.nReduce, type: "map" };
       }
-      if (!allDone(mapTasks)) return { type: "sleep" };
+      if (!allDone(mapTasks)) {
+        return { type: "sleep" };
+      }
       phase = "reduce";
     }
 
     if (phase === "reduce") {
-      const t = reduceTasks.find(x => x.state === "idle");
-      if (t) {
-        t.state = "in-progress"; t.workerId = req.workerId; t.startedAtMs = now();
-        return { type: "reduce", reduceId: t.id, nReduce: args.nReduce };
+      const task = reduceTasks.find(item => item.state === "idle");
+      if (task) {
+        task.state = "in-progress";
+        task.workerId = req.workerId;
+        task.startedAtMs = now();
+        return { nReduce: args.nReduce, reduceId: task.id, type: "reduce" };
       }
-      if (!allDone(reduceTasks)) return { type: "sleep" };
+      if (!allDone(reduceTasks)) {
+        return { type: "sleep" };
+      }
       phase = "done";
     }
 
     return { type: "done" };
   };
 
+  /**
+   * Handle a worker's task completion report
+   *
+   * @param req - {@link ReportRequest} with task kind, id, and success flag
+   */
   const onReport = (req: ReportRequest): void => {
     if (req.type === "map") {
-      const t = mapTasks[req.mapId];
-      if (t) {
-        t.state = req.success ? "done" : "idle";
-        clearAssignee(t);
-        if (allDone(mapTasks)) phase = "reduce";
+      const task = mapTasks[req.mapId];
+      if (task) {
+        if (req.success) {
+          task.state = "done";
+        } else {
+          task.state = "idle";
+        }
+        clearAssignee(task);
+        if (allDone(mapTasks)) {
+          phase = "reduce";
+        }
       }
       return;
     }
-    const t = reduceTasks[req.reduceId];
-    if (t) {
-      t.state = req.success ? "done" : "idle";
-      clearAssignee(t);
-      if (allDone(reduceTasks)) phase = "done";
+
+    const task = reduceTasks[req.reduceId];
+    if (task) {
+      if (req.success) {
+        task.state = "done";
+      } else {
+        task.state = "idle";
+      }
+      clearAssignee(task);
+      if (allDone(reduceTasks)) {
+        phase = "done";
+      }
     }
   };
 
+  // HTTP JSON server with two endpoints (/pollTask, /reportTask)
   const server = http.createServer(async (req, res) => {
     try {
       if (req.method === "POST" && req.url === "/pollTask") {
         const body = await readJson(req);
-        if (!isPollRequest(body)) { res.writeHead(400).end('{"error":"bad request"}'); return; }
+        if (!isPollRequest(body)) {
+          res.writeHead(HTTP_STATUS.BAD_REQUEST).end('{"error":"bad request"}');
+          return;
+        }
         const reply = onPoll(body);
-        res.writeHead(200, { "Content-Type": "application/json" }).end(JSON.stringify(reply));
+        res.writeHead(HTTP_STATUS.OK, { "Content-Type": "application/json" }).end(JSON.stringify(reply));
         return;
       }
+
       if (req.method === "POST" && req.url === "/reportTask") {
         const body = await readJson(req);
-        if (!isReportRequest(body)) { res.writeHead(400).end('{"error":"bad request"}'); return; }
+        if (!isReportRequest(body)) {
+          res.writeHead(HTTP_STATUS.BAD_REQUEST).end('{"error":"bad request"}');
+          return;
+        }
         onReport(body);
-        res.writeHead(200, { "Content-Type": "application/json" }).end('{"ok":true}');
+        res.writeHead(HTTP_STATUS.OK, { "Content-Type": "application/json" }).end('{"ok":true}');
         return;
       }
-      res.writeHead(404).end('{"error":"not found"}');
+
+      res.writeHead(HTTP_STATUS.NOT_FOUND).end('{"error":"not found"}');
     } catch {
-      res.writeHead(500).end('{"error":"server error"}');
+      res.writeHead(HTTP_STATUS.INTERNAL_ERROR).end('{"error":"server error"}');
     }
   });
 
   return server;
-}
+};
 
-async function main(): Promise<void> {
-  const args = await parseArgs(process.argv.slice(2));
+const main = async (): Promise<void> => {
+  const args = await parseArgs(process.argv.slice(ARGV_USER_INDEX));
   const server = createServer(args);
   server.listen(args.port, () => {
     console.log(`coordinator :${args.port} maps=${args.inputFiles.length} reduces=${args.nReduce}`);
   });
-}
+};
 
-main().catch(err => {
-  console.error(String(err?.message ?? err));
-  process.exit(1);
-});
+void (async () => {
+  try {
+    await main();
+  } catch (error) {
+    console.error(error);
+    process.exit(EXIT_ERROR);
+  }
+})();
