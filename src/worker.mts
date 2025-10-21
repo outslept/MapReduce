@@ -174,8 +174,8 @@ const readJsonlFiles = async (paths: readonly string[]): Promise<KV[]> => {
         } else {
           const obj = JSON.parse(line) as unknown;
           if (typeof obj === "object" && obj !== null && "key" in obj && "value" in obj) {
-            const keyAny = (obj as { key: unknown }).key;
-            const valueAny = (obj as { value: unknown }).value;
+            const keyAny = obj.key;
+            const valueAny = obj.value;
             if (typeof keyAny === "string" && typeof valueAny === "string") {
               out.push({ key: keyAny, value: valueAny });
             }
