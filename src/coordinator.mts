@@ -52,15 +52,19 @@ const now = (): number => Date.now();
  * @param items - Task collection to check
  * @returns True if every task is "done"
  */
-const allDone = <TaskType extends { state: "idle" | "in-progress" | "done" }>(items: readonly TaskType[]): boolean =>
-  items.every(task => task.state === "done");
+const allDone = <TaskType extends { state: "idle" | "in-progress" | "done" }>(
+  items: readonly TaskType[],
+): boolean => items.every((task) => task.state === "done");
 
 /**
  * Clear transient assignee metadata for a task (worker id and start time)
  *
  * @param task - Task object to clear
  */
-const clearAssignee = (task: { workerId?: string; startedAtMs?: number }): void => {
+const clearAssignee = (task: {
+  workerId?: string;
+  startedAtMs?: number;
+}): void => {
   delete task.workerId;
   delete task.startedAtMs;
 };
@@ -82,31 +86,37 @@ const clearAssignee = (task: { workerId?: string; startedAtMs?: number }): void 
  * // cfg.inputFiles => ["data/pg-0001.txt", ...]
  */
 const parseArgs = async (argv: readonly string[]): Promise<Args> => {
-  const portFlag = argv.find(arg => arg.startsWith("--port=")) ?? "--port=8787";
-  const nReduceFlag = argv.find(arg => arg.startsWith("--nReduce=")) ?? "--nReduce=4";
+  const portFlag =
+    argv.find((arg) => arg.startsWith("--port=")) ?? "--port=8787";
+  const nReduceFlag =
+    argv.find((arg) => arg.startsWith("--nReduce=")) ?? "--nReduce=4";
   const port = Number(portFlag.split("=")[FLAG_VALUE_INDEX]);
   const nReduce = Number(nReduceFlag.split("=")[FLAG_VALUE_INDEX]);
 
-  const rawInputs = argv.filter(arg => !arg.startsWith("--"));
-  const patterns = rawInputs.map(pattern => pattern.replace(/\\/g, "/"));
+  const rawInputs = argv.filter((arg) => !arg.startsWith("--"));
+  const patterns = rawInputs.map((pattern) => pattern.replace(/\\/g, "/"));
 
   let matched: string[] = [];
   if (patterns.length > EMPTY_LENGTH) {
     const candidates = await glob(patterns);
 
-    const validated = (await Promise.all(
-      candidates.map(async (candidatePath) => {
-        try {
-          const stat = await fsp.stat(candidatePath);
-          if (stat.isFile()) {
-            return candidatePath;
+    const validated = (
+      await Promise.all(
+        candidates.map(async (candidatePath) => {
+          try {
+            const stat = await fsp.stat(candidatePath);
+            if (stat.isFile()) {
+              return candidatePath;
+            }
+          } catch {
+            // noop
           }
-        } catch {
-          // noop
-        }
-        return undefined;
-      })
-    )).filter((candidatePath): candidatePath is string => candidatePath !== undefined);
+          return undefined;
+        }),
+      )
+    ).filter(
+      (candidatePath): candidatePath is string => candidatePath !== undefined,
+    );
 
     const unique = new Set<string>(validated);
     matched = [...unique];
@@ -116,9 +126,11 @@ const parseArgs = async (argv: readonly string[]): Promise<Args> => {
   if (!Number.isInteger(port) || port < MIN_PORT) {
     throw new Error("bad --port");
   }
+
   if (!Number.isInteger(nReduce) || nReduce < MIN_REDUCERS) {
     throw new Error("bad --nReduce");
   }
+
   if (matched.length === EMPTY_LENGTH) {
     throw new Error("no input files");
   }
@@ -145,7 +157,9 @@ const readJson = async (req: http.IncomingMessage): Promise<unknown> => {
   }
   const body = Buffer.concat(chunks).toString("utf8");
   if (body.length === EMPTY_LENGTH) {
-    return {};
+    return {
+      /* noop */
+    };
   }
   return JSON.parse(body);
 };
@@ -160,8 +174,15 @@ const readJson = async (req: http.IncomingMessage): Promise<unknown> => {
  * @returns An HTTP server instance (not yet listening)
  */
 const createServer = (args: Args): http.Server => {
-  const mapTasks: MapTask[] = args.inputFiles.map((filePath, taskId) => ({ file: filePath, id: taskId, state: "idle" }));
-  const reduceTasks: ReduceTask[] = Array.from({ length: args.nReduce }, (_unused, taskId) => ({ id: taskId, state: "idle" }));
+  const mapTasks: MapTask[] = args.inputFiles.map((filePath, taskId) => ({
+    file: filePath,
+    id: taskId,
+    state: "idle",
+  }));
+  const reduceTasks: ReduceTask[] = Array.from(
+    { length: args.nReduce },
+    (_unused, taskId) => ({ id: taskId, state: "idle" }),
+  );
   let phase: Phase = "map";
 
   /** Return in-progress tasks back to idle after TIMEOUT_MS */
@@ -169,13 +190,22 @@ const createServer = (args: Args): http.Server => {
     const deadline = now() - TIMEOUT_MS;
 
     for (const task of mapTasks) {
-      if (task.state === "in-progress" && task.startedAtMs !== undefined && task.startedAtMs <= deadline) {
+      if (
+        task.state === "in-progress" &&
+        task.startedAtMs !== undefined &&
+        task.startedAtMs <= deadline
+      ) {
         task.state = "idle";
         clearAssignee(task);
       }
     }
+
     for (const task of reduceTasks) {
-      if (task.state === "in-progress" && task.startedAtMs !== undefined && task.startedAtMs <= deadline) {
+      if (
+        task.state === "in-progress" &&
+        task.startedAtMs !== undefined &&
+        task.startedAtMs <= deadline
+      ) {
         task.state = "idle";
         clearAssignee(task);
       }
@@ -192,30 +222,41 @@ const createServer = (args: Args): http.Server => {
     reapTimeouts();
 
     if (phase === "map") {
-      const task = mapTasks.find(item => item.state === "idle");
+      const task = mapTasks.find((item) => item.state === "idle");
+
       if (task) {
         task.state = "in-progress";
         task.workerId = req.workerId;
         task.startedAtMs = now();
-        return { file: task.file, mapId: task.id, nReduce: args.nReduce, type: "map" };
+        return {
+          file: task.file,
+          mapId: task.id,
+          nReduce: args.nReduce,
+          type: "map",
+        };
       }
+
       if (!allDone(mapTasks)) {
         return { type: "sleep" };
       }
+
       phase = "reduce";
     }
 
     if (phase === "reduce") {
-      const task = reduceTasks.find(item => item.state === "idle");
+      const task = reduceTasks.find((item) => item.state === "idle");
+
       if (task) {
         task.state = "in-progress";
         task.workerId = req.workerId;
         task.startedAtMs = now();
         return { nReduce: args.nReduce, reduceId: task.id, type: "reduce" };
       }
+
       if (!allDone(reduceTasks)) {
         return { type: "sleep" };
       }
+
       phase = "done";
     }
 
@@ -268,7 +309,9 @@ const createServer = (args: Args): http.Server => {
           return;
         }
         const reply = onPoll(body);
-        res.writeHead(HTTP_STATUS.OK, { "Content-Type": "application/json" }).end(JSON.stringify(reply));
+        res
+          .writeHead(HTTP_STATUS.OK, { "Content-Type": "application/json" })
+          .end(JSON.stringify(reply));
         return;
       }
 
@@ -279,7 +322,9 @@ const createServer = (args: Args): http.Server => {
           return;
         }
         onReport(body);
-        res.writeHead(HTTP_STATUS.OK, { "Content-Type": "application/json" }).end('{"ok":true}');
+        res
+          .writeHead(HTTP_STATUS.OK, { "Content-Type": "application/json" })
+          .end('{"ok":true}');
         return;
       }
 
@@ -296,7 +341,9 @@ const main = async (): Promise<void> => {
   const args = await parseArgs(process.argv.slice(ARGV_USER_INDEX));
   const server = createServer(args);
   server.listen(args.port, () => {
-    console.log(`coordinator :${args.port} maps=${args.inputFiles.length} reduces=${args.nReduce}`);
+    console.log(
+      `coordinator :${args.port} maps=${args.inputFiles.length} reduces=${args.nReduce}`,
+    );
   });
 };
 

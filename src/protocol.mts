@@ -48,8 +48,17 @@ interface PollRequest {
  * }
  */
 type PollResponse =
-  | { readonly type: "map"; readonly mapId: number; readonly file: string; readonly nReduce: number }
-  | { readonly type: "reduce"; readonly reduceId: number; readonly nReduce: number }
+  | {
+      readonly type: "map";
+      readonly mapId: number;
+      readonly file: string;
+      readonly nReduce: number;
+    }
+  | {
+      readonly type: "reduce";
+      readonly reduceId: number;
+      readonly nReduce: number;
+    }
   | { readonly type: "sleep" }
   | { readonly type: "done" };
 
@@ -67,8 +76,18 @@ type PollResponse =
  * const failReduce: ReportRequest = { workerId: "w1", type: "reduce", reduceId: 2, success: false };
  */
 type ReportRequest =
-  | { readonly workerId: string; readonly type: "map"; readonly mapId: number; readonly success: boolean }
-  | { readonly workerId: string; readonly type: "reduce"; readonly reduceId: number; readonly success: boolean };
+  | {
+      readonly workerId: string;
+      readonly type: "map";
+      readonly mapId: number;
+      readonly success: boolean;
+    }
+  | {
+      readonly workerId: string;
+      readonly type: "reduce";
+      readonly reduceId: number;
+      readonly success: boolean;
+    };
 
 /**
  * Map function signature for plugins
@@ -164,7 +183,11 @@ const isReportRequest = (val: unknown): val is ReportRequest => {
     return false;
   }
   const obj = val;
-  if (typeof obj.workerId !== "string" || typeof obj.type !== "string" || typeof obj.success !== "boolean") {
+  if (
+    typeof obj.workerId !== "string" ||
+    typeof obj.type !== "string" ||
+    typeof obj.success !== "boolean"
+  ) {
     return false;
   }
   if (obj.type === "map") {
@@ -198,14 +221,15 @@ const isPollResponse = (val: unknown): val is PollResponse => {
   }
 
   if (taskType === "map") {
-    return isPositiveInt(val.mapId) &&
-           typeof val.file === "string" &&
-           isPositiveInt(val.nReduce);
+    return (
+      isPositiveInt(val.mapId) &&
+      typeof val.file === "string" &&
+      isPositiveInt(val.nReduce)
+    );
   }
 
   if (taskType === "reduce") {
-    return isPositiveInt(val.reduceId) &&
-           isPositiveInt(val.nReduce);
+    return isPositiveInt(val.reduceId) && isPositiveInt(val.nReduce);
   }
   return false;
 };
@@ -220,5 +244,5 @@ export {
   type PluginModule,
   isPollRequest,
   isReportRequest,
-  isPollResponse
+  isPollResponse,
 };

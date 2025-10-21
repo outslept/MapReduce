@@ -1,6 +1,13 @@
 import { createReadStream, promises as fsp } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { isPollResponse, type KV, type MapFn, type PluginModule, type PollResponse, type ReduceFn } from "./protocol.mjs";
+import {
+  isPollResponse,
+  type KV,
+  type MapFn,
+  type PluginModule,
+  type PollResponse,
+  type ReduceFn,
+} from "./protocol.mjs";
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
 import { setTimeout as delay } from "node:timers/promises";
@@ -32,7 +39,7 @@ const EXIT_ERR = 1;
 const EMPTY = 0;
 const HEX_RADIX = 16;
 
-const FNV_OFFSET_BASIS = 0x811C9DC5;
+const FNV_OFFSET_BASIS = 0x811c9dc5;
 const FNV_PRIME = 0x01000193;
 
 /**
@@ -130,7 +137,10 @@ const postJSON = async (url: string, body: unknown): Promise<unknown> => {
  * @example
  * await writeAtomic("mr-out-0", "payload\n")
  */
-const writeAtomic = async (filePath: string, data: string | Buffer): Promise<void> => {
+const writeAtomic = async (
+  filePath: string,
+  data: string | Buffer,
+): Promise<void> => {
   const tmp = `${filePath}.${Math.random().toString(HEX_RADIX).slice(FLAG_VALUE_INDEX)}.tmp`;
   await fsp.writeFile(tmp, data);
   await fsp.rename(tmp, filePath);
@@ -146,7 +156,10 @@ const writeAtomic = async (filePath: string, data: string | Buffer): Promise<voi
  * @example
  * await writeJsonl("mr-0-1-worker.jsonl", [{ key: "word", value: "1" }])
  */
-const writeJsonl = async (filePath: string, rows: readonly KV[]): Promise<void> => {
+const writeJsonl = async (
+  filePath: string,
+  rows: readonly KV[],
+): Promise<void> => {
   let payload = rows.map((row) => JSON.stringify(row)).join("\n");
   if (rows.length > EMPTY) {
     payload += "\n";
@@ -167,13 +180,21 @@ const readJsonlFiles = async (paths: readonly string[]): Promise<KV[]> => {
   const out: KV[] = [];
   for (const filePath of paths) {
     try {
-      const rl = createInterface({ crlfDelay: Infinity, input: createReadStream(filePath) });
+      const rl = createInterface({
+        crlfDelay: Infinity,
+        input: createReadStream(filePath),
+      });
       for await (const line of rl) {
         if (line.length === EMPTY) {
           // skip empty
         } else {
           const obj = JSON.parse(line);
-          if (typeof obj === "object" && obj !== null && "key" in obj && "value" in obj) {
+          if (
+            typeof obj === "object" &&
+            obj !== null &&
+            "key" in obj &&
+            "value" in obj
+          ) {
             const keyAny = obj.key;
             const valueAny = obj.value;
             if (typeof keyAny === "string" && typeof valueAny === "string") {
@@ -198,7 +219,9 @@ const readJsonlFiles = async (paths: readonly string[]): Promise<KV[]> => {
  * @example
  * const groups = groupByKeySorted([{key:"a",value:"1"},{key:"a",value:"1"},{key:"b",value:"1"}])
  */
-const groupByKeySorted = (pairs: KV[]): readonly (readonly [string, string[]])[] => {
+const groupByKeySorted = (
+  pairs: KV[],
+): readonly (readonly [string, string[]])[] => {
   pairs.sort((left, right) => left.key.localeCompare(right.key));
   const grouped: (readonly [string, string[]])[] = [];
   let currentKey: string | undefined = undefined;
@@ -269,7 +292,7 @@ const doMapTask = async (options: MapTaskOptions): Promise<void> => {
     buckets.map(async (rows, reduceId) => {
       const outPath = `mr-${mapId}-${reduceId}-${workerId}.jsonl`;
       await writeJsonl(outPath, rows);
-    })
+    }),
   );
 };
 
@@ -286,7 +309,10 @@ const doMapTask = async (options: MapTaskOptions): Promise<void> => {
  * @example
  * await doReduceTask(0, reduceFn)
  */
-const doReduceTask = async (reduceId: number, reduceFn: ReduceFn): Promise<void> => {
+const doReduceTask = async (
+  reduceId: number,
+  reduceFn: ReduceFn,
+): Promise<void> => {
   const names = await fsp.readdir(process.cwd());
   const rx = new RegExp(`^mr-(\\d+)-${reduceId}-[a-f0-9-]+\\.jsonl$`);
   const files = names.filter((name) => rx.test(name));
@@ -320,7 +346,8 @@ const toFileUrl = (filePath: string): string => {
  * @returns True if v is a non-null object
  * @internal
  */
-const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null;
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null;
 
 /**
  * Validate a plugin-like object (has map and reduce functions)
@@ -330,7 +357,9 @@ const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "obj
  * @internal
  */
 const isPluginModule = (v: unknown): v is PluginModule => {
-  return isRecord(v) && typeof v.map === "function" && typeof v.reduce === "function";
+  return (
+    isRecord(v) && typeof v.map === "function" && typeof v.reduce === "function"
+  );
 };
 
 /**
@@ -361,11 +390,15 @@ const loadPlugin = async (pluginPath: string): Promise<PluginModule> => {
     return candidate;
   }
 
-  throw new Error("plugin must export map(filename, content) and reduce(key, values)");
+  throw new Error(
+    "plugin must export map(filename, content) and reduce(key, values)",
+  );
 };
 
 const main = async (): Promise<void> => {
-  const { coordUrl, pluginPath } = parseArgs(process.argv.slice(ARG_SLICE_INDEX));
+  const { coordUrl, pluginPath } = parseArgs(
+    process.argv.slice(ARG_SLICE_INDEX),
+  );
   const workerId = randomUUID();
   const plugin = await loadPlugin(pluginPath);
 
@@ -413,6 +446,7 @@ const main = async (): Promise<void> => {
           nReduce: task.nReduce,
           workerId,
         });
+
         await postJSON(`${coordUrl}/reportTask`, {
           mapId: task.mapId,
           success: true,
@@ -421,6 +455,7 @@ const main = async (): Promise<void> => {
         });
       } else {
         await doReduceTask(task.reduceId, plugin.reduce);
+
         await postJSON(`${coordUrl}/reportTask`, {
           reduceId: task.reduceId,
           success: true,
