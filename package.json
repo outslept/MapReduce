@@ -1,4 +1,9 @@
 {
+  "scripts": {
+    "dev:coordinator": "bun run src/coordinator.mts",
+    "dev:worker": "bun run src/worker.mts",
+    "lint": "oxlint"
+  },
 	"devDependencies": {
 		"@types/node": "^24.9.1",
 		"oxlint": "^1.23.0",
