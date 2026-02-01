@@ -5,7 +5,7 @@
     "lint": "oxlint"
   },
 	"devDependencies": {
-		"@types/node": "^24.9.1",
+		"@types/node": "^25.1.0",
 		"oxlint": "^1.23.0",
 		"oxlint-tsgolint": "^0.2.0",
 		"typescript": "^5.9.3"
